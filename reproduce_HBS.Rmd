@@ -1,0 +1,389 @@
+---
+title: "HBS"
+author: "Shuyu Guo"
+date: "12/5/2024"
+output: html_document
+---
+
+
+```{r}
+# Create a hamming ball around a current state
+
+generate_hamming_ball = function(current_state, m) {
+  # current_state: center of the ball
+  # m: max number of elements that can flip
+  
+  n = length(current_state)  
+  hamming_ball = list()      # Store all states in the Hamming ball
+  
+  # Include the current state itself (no flips)
+  hamming_ball[[1]] = current_state
+  
+  # Generate all possible flips from 1 to m bits
+  for (k in 1:m) {
+    # Get all combinations of indices to flip
+    flip_locations = combn(n, k, simplify = FALSE)
+    
+    # Flip the selected bits for each combination
+    for (indices in flip_locations) {
+      new_state = current_state
+      new_state[indices] = 1 - new_state[indices]  # Flip 0 -> 1 or 1 -> 0
+      hamming_ball[[length(hamming_ball) + 1]] <- new_state
+    }
+  }
+  
+  # Return the Hamming ball as a matrix for convenience
+  do.call(rbind, hamming_ball)
+}
+
+# usage example
+current_state = c(0, 1, 0, 1)
+m = 2
+hamming_ball = generate_hamming_ball(current_state, m)
+print(hamming_ball)
+```
+
+
+
+```{r}
+# compute the joint density
+# specific case for signal detecting
+# Y: observations
+# X: binary 0,1
+
+log_joint_weight = function(Y, Z, X, a_pi, b_pi, a_sigma, b_sigma, g){
+  N = length(Y)
+  D = length(X)
+  s = sum(X)
+  Z_X = Z[,X==1]
+  XtX_inv = solve(crossprod(Z_X,Z_X) + diag(0.00001,s))
+  P_Y = tcrossprod(Z_X, XtX_inv) %*% crossprod(Z_X,as.vector(Y))
+  P_Y = as.vector(P_Y)
+  log_weight = - s/2 * log(1+g) + lgamma(s+a_pi) + lgamma(D-s+b_pi) - (2*a_sigma+N)/2 * log(2* b_sigma + crossprod(Y,Y) - g/(1+g)*crossprod(P_Y,P_Y))
+  return(log_weight)
+}
+```
+
+
+
+
+```{r}
+# main function of sampling algorithm
+
+# the notation is kept the same as the paper
+# X: binary vector or matrix
+# U: binary vector or matrix
+# block_num: the number of blocks (P in paper)
+# m: radius of the hamming ball of each block
+
+# a_pi, b_pi, a_sigma, b_sigma, g: hyperparameters
+
+# here we suppose X is 1-d vector and S = 2 (0 and 1)
+hamming_ball_sampler = function(Y, Z, a_pi, b_pi, a_sigma, b_sigma, g, init_X, iter_num, block_num, m){
+  # S: each element of X can be (1,...,S)
+  # S = length(unique(X_init))
+  D = length(init_X)
+  K = D/block_num
+  X_mcmc = matrix(rep(0,iter_num*D),nrow = iter_num)
+  # psi_list = generate_psi(Y)
+  
+  
+  X = init_X
+  for (t in 1:iter_num) {
+    # break X into 'block_num' many blocks randomly
+    # D: total number of elements in X
+    # K: number of elements in each block
+
+    #break X into P random blocks
+    shuffled = sample(D)
+    block_label = split(shuffled, rep(1:block_num,each = K)) 
+    #block_label here is a list of length P (block_num)
+    block_label = do.call(rbind, block_label)
+    
+    
+    for (r in 1:nrow(block_label)) {
+      block_label[r,] = sort(block_label[r,])
+    }
+    
+    
+    # draw u_i and x_i in each block:
+    for (i in 1:block_num) {
+      loc = block_label[i,]
+      xi = X[loc]
+      
+      # hamming ball around x_i:
+      Hm_xi = generate_hamming_ball(xi, m)
+
+      # cardinality of Hm_xi
+      z = nrow(Hm_xi)
+      
+      # draw ui: 
+      ui_new = Hm_xi[sample(z,size = 1),]
+      
+      # draw xi:
+      # compute the weight of each xi in hamming ball centered at ui
+      Hm_ui = generate_hamming_ball(ui_new, m)
+      xi_log_weight = rep(0,z)
+      for (j in 1:z) {
+        # in the whole vector X, replace block i with x_i where x_i is in the hamming ball around u_i
+        X_i = X
+        X_i[loc] = Hm_ui[j,]
+        if(sum(X_i)==0){
+          xi_log_weight[j] = -Inf
+        }else{
+          xi_log_weight[j] = log_joint_weight(Y, Z, X_i, a_pi, b_pi, a_sigma, b_sigma, g)
+        }
+      }
+      
+      xi_log_weight = xi_log_weight - max(xi_log_weight)
+      xi_weight = exp(xi_log_weight)
+      xi_new = Hm_ui[sample(1:z, size = 1,prob = xi_weight),]
+      X[loc] = xi_new
+      
+    }
+    
+    X_mcmc[t,] = X
+    if(t%%10 == 0){
+      cat("iter: ", t, "nonzero:", sum(X), "\n",sep = " ")
+    }
+    
+  }
+  
+  return(X_mcmc)
+}
+```
+
+
+Reproduce example 2 from Titsias MK, Yau C. The Hamming Ball Sampler. J Am Stat Assoc. 2017:
+
+
+```{r}
+# generate data (example 2 in paper)
+N = 100
+D_half = 200
+D = D_half*2
+eps = rnorm(N,sd = 0.1)
+Z_half_elements = sample(c(1,2,3),size = N*D_half,replace = TRUE)
+Z_half = matrix(Z_half_elements, nrow = N)
+Z = cbind(Z_half,Z_half)
+Y = Z_half[,11] + eps
+
+# apply HBS
+X_init = sample(c(0,1),size = D, replace = TRUE, prob = c(0.99,0.01))
+
+hbs_fit = hamming_ball_sampler(Y, Z, a_pi=0.001, b_pi=1, a_sigma=0.1, b_sigma=0.1, g=100, init_X = X_init, iter_num = 10000, block_num = 10, m = 1)
+```
+
+
+```{r}
+burnt_in = 100
+hbs_fit = hbs_fit[(burnt_in+1):nrow(hbs_fit),]
+inclusion_prob = apply(hbs_fit, 2, cumsum)/1:nrow(hbs_fit)
+plot(1:nrow(hbs_fit),as.vector(inclusion_prob[,11]),type = "l",col = "red")
+lines(1:nrow(hbs_fit),as.vector(inclusion_prob[,211]),type = "l",col = "blue")
+```
+
+
+Next, we run simulations for and plot the posterior inclusion probability across iterations.
+
+
+```{r}
+# plot posterior inclusion probability
+
+plot_post_inc_prob = function(hbs_X_mat, burnt_in, colors, lwds){
+  hbs_X_mat_ = hbs_X_mat[(burnt_in+1):nrow(hbs_X_mat),]
+  inclusion_prob = apply(hbs_X_mat_, 2, cumsum)/1:nrow(hbs_X_mat_)
+  par(mar=c(5, 4, 4, 8), xpd=TRUE)
+  plot(1:nrow(inclusion_prob),as.vector(inclusion_prob[,4]),type = "l", col = "lightgrey",ylim = c(0,1), main = "Posterior Inclusion Probability", xlab = "Iteration", ylab = "Inclusion Probability")
+  for (i in 5:400) {
+    lines(1:nrow(inclusion_prob),as.vector(inclusion_prob[,i]),type = "l",col = "lightgrey")
+  }
+  for (i in 1:3) {
+    lines(1:nrow(inclusion_prob),as.vector(inclusion_prob[,i]),type = "l", col = colors[i],lwd = lwds[i])
+  }
+  legend("topright", inset=c(-0.3, 0), legend = c("X1","X2","X3","X4:X400"), col = c(colors,"lightgrey"),lwd = 2)
+}
+```
+
+
+```{r}
+# generate data
+# population covariance matrix Sigma: diagonal = 1; off-diagonal = covariance
+# sigma: standard error of linear model error term 
+# N: Number of rows (observations)
+# D: Number of columns (potential predictors)
+
+library(MASS)
+gen_data = function(N, D, seed,sigma, covariance){
+  Sigma = matrix(covariance, nrow = D, ncol = D)
+  diag(Sigma) = 1  
+  
+  set.seed(seed)
+  Z = mvrnorm(n = N, mu = rep(0, D), Sigma = Sigma)
+  eps = rnorm(N, 0, sigma)
+  Y = Z[,1] + Z[,2] + Z[,3] + eps
+  return(list("Y" = Y,"Z" = Z))
+}
+```
+
+
+
+```{r}
+# Simulation 1:
+# columns of design matrix Z uncorrelated.
+# hamming ball radius m = 1
+
+data_ = gen_data(N = 100, D = 400, seed = 123, sigma = 1, covariance = 0)
+Y = data_$Y
+Z = data_$Z
+
+# apply HBS
+set.seed(1234)
+X_init = sample(c(0,1),size = D, replace = TRUE, prob = c(0.9,0.1))
+
+hbs_ind_m1 = hamming_ball_sampler(Y, Z, a_pi=0.001, b_pi=1, a_sigma=0.1, b_sigma=0.1, g=100, init_X = X_init, iter_num = 2000, block_num = 10, m = 1)
+```
+
+
+
+```{r}
+colors = c("red", "blue","green") 
+lwds = c(10,5,2)
+plot_post_inc_prob(hbs_ind_m1, 10, colors,lwds)
+```
+
+
+```{r}
+# Simulation 2: 
+# columns of design matrix Z are uncorrelated.
+# hamming ball radius m = 2.
+
+data_ = gen_data(N = 100, D = 400, seed = 123, sigma = 1, covariance = 0)
+Y = data_$Y
+Z = data_$Z
+
+# apply HBS
+set.seed(1234)
+X_init = sample(c(0,1),size = D, replace = TRUE, prob = c(0.9,0.1))
+
+hbs_ind_m2 = hamming_ball_sampler(Y, Z, a_pi=0.001, b_pi=1, a_sigma=0.1, b_sigma=0.1, g=100, init_X = X_init, iter_num = 2000, block_num = 10, m = 2)
+```
+
+
+
+```{r}
+colors = c("red", "blue","green") 
+lwds = c(10,5,2)
+plot_post_inc_prob(hbs_ind_m2, 0, colors,lwds)
+```
+
+```{r}
+# Simulation 3: 
+# columns of design matrix Z are correlated: rho = 0.5.
+# hamming ball radius m = 1.
+
+data_ = gen_data(N = 100, D = 400, seed = 123, sigma = 1, covariance = 0.5)
+Y = data_$Y
+Z = data_$Z
+
+# apply HBS
+set.seed(1234)
+X_init = sample(c(0,1),size = D, replace = TRUE, prob = c(0.9,0.1))
+
+hbs_dep2_m1 = hamming_ball_sampler(Y, Z, a_pi=0.001, b_pi=1, a_sigma=0.1, b_sigma=0.1, g=100, init_X = X_init, iter_num = 2000, block_num = 10, m = 1)
+```
+
+
+
+```{r}
+colors = c("red", "blue","green") 
+lwds = c(5,2,2)
+plot_post_inc_prob(hbs_dep2_m1, 0, colors,lwds)
+```
+
+
+```{r}
+# Simulation 4: 
+# columns of design matrix Z are correlated: rho = 0.5.
+# hamming ball radius m = 2.
+
+data_ = gen_data(N = 100, D = 400, seed = 123, sigma = 1, covariance = 0.5)
+Y = data_$Y
+Z = data_$Z
+
+# apply HBS
+set.seed(1234)
+X_init = sample(c(0,1),size = D, replace = TRUE, prob = c(0.9,0.1))
+
+hbs_dep2_m2 = hamming_ball_sampler(Y, Z, a_pi=0.001, b_pi=1, a_sigma=0.1, b_sigma=0.1, g=100, init_X = X_init, iter_num = 2000, block_num = 10, m = 2)
+```
+
+
+
+```{r}
+colors = c("red", "blue","green") 
+lwds = c(5,2,2)
+plot_post_inc_prob(hbs_dep2_m2, 0, colors,lwds)
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Simulation 5: 
+# columns of design matrix Z are correlated: rho = 0.7.
+# hamming ball radius m = 1.
+
+
+data_ = gen_data(N = 100, D = 400, seed = 123, sigma = 1, covariance = 0.7)
+Y = data_$Y
+Z = data_$Z
+
+# apply HBS
+set.seed(1234)
+X_init = sample(c(0,1),size = D, replace = TRUE, prob = c(0.9,0.1))
+
+hbs_dep1_m1 = hamming_ball_sampler(Y, Z, a_pi=0.001, b_pi=1, a_sigma=0.1, b_sigma=0.1, g=100, init_X = X_init, iter_num = 2000, block_num = 10, m = 1)
+```
+
+
+```{r}
+colors = c("red", "blue","green") 
+lwds = c(2,2,2)
+plot_post_inc_prob(hbs_dep1_m1, 10, colors,lwds)
+```
+
+```{r}
+# Simulation 6: 
+# columns of design matrix Z are correlated: rho = 0.7.
+# hamming ball radius m = 2.
+
+data_ = gen_data(N = 100, D = 400, seed = 123, sigma = 1, covariance = 0.7)
+Y = data_$Y
+Z = data_$Z
+
+# apply HBS
+set.seed(1234)
+X_init = sample(c(0,1),size = D, replace = TRUE, prob = c(0.9,0.1))
+
+hbs_dep1_m2 = hamming_ball_sampler(Y, Z, a_pi=0.001, b_pi=1, a_sigma=0.1, b_sigma=0.1, g=100, init_X = X_init, iter_num = 2000, block_num = 10, m = 2)
+```
+
+
+```{r}
+colors = c("red", "blue","green") 
+lwds = c(2,4,2)
+plot_post_inc_prob(hbs_dep1_m2, 10, colors,lwds)
+```
+
+
+
+
+
+
